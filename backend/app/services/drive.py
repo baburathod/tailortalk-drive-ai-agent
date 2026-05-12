@@ -80,8 +80,22 @@ class DriveService:
                     file_found = True
                     logger.info(f"  ✅ Found file candidate at: {path}")
                     try:
-                        self.credentials = service_account.Credentials.from_service_account_file(
-                            path, scopes=self.scopes
+                        # Manually load the JSON to handle copy-paste corruptions from cloud dashboards
+                        with open(path, 'r', encoding='utf-8') as f:
+                            creds_info = json.load(f)
+                            
+                        # Auto-repair the PEM key if newlines were double-escaped
+                        if "private_key" in creds_info:
+                            pk = creds_info["private_key"]
+                            # Fix literal backslash-n to actual newlines
+                            pk = pk.replace('\\n', '\n')
+                            # Ensure trailing newline is present
+                            if not pk.endswith('\n'):
+                                pk += '\n'
+                            creds_info["private_key"] = pk
+                            
+                        self.credentials = service_account.Credentials.from_service_account_info(
+                            creds_info, scopes=self.scopes
                         )
                         logger.info(f"✅ Successfully loaded credentials from file: {path}")
                         self.init_error = None
