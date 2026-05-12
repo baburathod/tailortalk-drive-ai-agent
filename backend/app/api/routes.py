@@ -53,17 +53,14 @@ async def chat_endpoint(request: ChatRequest):
         
     # Check credentials before processing
     if not drive_service.credentials:
-        logger.error("[API] ❌ Google Drive credentials not loaded")
+        logger.error(f"[API] ❌ Google Drive credentials not loaded. Reason: {drive_service.init_error}")
         error_response = (
-            "❌ **Google Drive Authentication Failed**\n\n"
-            "The system cannot access your Google Drive. This means:\n\n"
-            "1. **credentials.json is not loaded** - The Service Account credentials file is missing\n"
-            "2. **Check your Render setup**:\n"
-            "   - Go to your Render service Settings\n"
-            "   - Add a **Secret File** named `credentials.json`\n"
-            "   - Paste your entire Google Service Account JSON\n"
-            "3. **Redeploy** your backend service\n\n"
-            "Once fixed, your queries like 'Find PDFs' will work correctly."
+            f"❌ **Google Drive Authentication Failed**\n\n"
+            f"The system cannot access your Google Drive. Diagnostic details:\n"
+            f"**`{drive_service.init_error}`**\n\n"
+            f"1. **If it says 'File found... but malformed'**: Your JSON text may be missing a bracket or contains invalid spaces. Try copying it again.\n"
+            f"2. **If it says 'missing from Render container'**: Check if your Render deploy is still actively building, or verify you used the exact filename `credentials.json`.\n\n"
+            f"Once corrected, Render will redeploy automatically!"
         )
         logger.error(f"[API] Returning error message to user")
         return ChatResponse(response=error_response)
