@@ -46,6 +46,11 @@ async def chat_endpoint(request: ChatRequest):
     logger.info(f"[API] User message: {request.message[:100]}...")
     logger.info(f"[API] History length: {len(request.history)}")
     
+    # Dynamically verify/reload credentials per request lifecycle to capture cloud environment mappings
+    if not drive_service.service:
+        logger.info("[API] Service missing. Executing dynamic initialization before routing...")
+        drive_service.initialize()
+        
     # Check credentials before processing
     if not drive_service.credentials:
         logger.error("[API] ❌ Google Drive credentials not loaded")

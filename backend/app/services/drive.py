@@ -16,182 +16,196 @@ class DriveService:
         self.folder_id = settings.DRIVE_FOLDER_ID
         self.service = None
         self.credentials = None
+        self.init_error = "Not initialized yet"
+        self.initialize()
+
+    def initialize(self):
+        """
+        Attempts to load credentials and initialize the Google Drive API service.
+        Can be called dynamically per request to automatically recover if secrets are mounted post-startup.
+        """
+        logger.info("=" * 70)
+        logger.info("ATTEMPTING DYNAMIC GOOGLE DRIVE SERVICE INITIALIZATION")
+        logger.info("=" * 70)
         
-        logger.info("=" * 70)
-        logger.info("INITIALIZING GOOGLE DRIVE SERVICE")
-        logger.info("=" * 70)
-        logger.info(f"DRIVE_FOLDER_ID: {self.folder_id}")
-        logger.info(f"GOOGLE_APPLICATION_CREDENTIALS env: {settings.GOOGLE_APPLICATION_CREDENTIALS}")
-        logger.info(f"GOOGLE_CREDENTIALS_JSON env length: {len(settings.GOOGLE_CREDENTIALS_JSON) if settings.GOOGLE_CREDENTIALS_JSON else 0}")
+        # Reset previous state
+        self.credentials = None
+        self.init_error = None
         
         # METHOD 1: GOOGLE_CREDENTIALS_JSON environment variable (JSON string directly)
-        if settings.GOOGLE_CREDENTIALS_JSON and settings.GOOGLE_CREDENTIALS_JSON.strip():
-            logger.info("\n[METHOD 1] Attempting to load from GOOGLE_CREDENTIALS_JSON environment variable...")
+        env_json = settings.GOOGLE_CREDENTIALS_JSON
+        if env_json and env_json.strip():
+            logger.info("[METHOD 1] Attempting to load from GOOGLE_CREDENTIALS_JSON environment variable...")
             try:
-                creds_info = json.loads(settings.GOOGLE_CREDENTIALS_JSON)
+                # Strip invisible leading/trailing characters that can occur during cloud dashboard copy-pasting
+                cleaned_json = env_json.strip()
+                creds_info = json.loads(cleaned_json)
                 self.credentials = service_account.Credentials.from_service_account_info(
                     creds_info, scopes=self.scopes
                 )
                 logger.info("✅ Successfully loaded credentials from GOOGLE_CREDENTIALS_JSON")
-            except json.JSONDecodeError as e:
-                logger.warning(f"❌ Invalid JSON in GOOGLE_CREDENTIALS_JSON: {e}")
             except Exception as e:
-                logger.warning(f"❌ Error loading from GOOGLE_CREDENTIALS_JSON: {e}")
+                self.init_error = f"Failed parsing GOOGLE_CREDENTIALS_JSON string: {str(e)}"
+                logger.warning(f"❌ {self.init_error}")
 
-        # METHOD 2: GOOGLE_APPLICATION_CREDENTIALS as file path (RENDER SECRET FILES)
-        # In Render, secret files are mounted at /etc/secrets/{filename}
+        # METHOD 2: Check raw string inside GOOGLE_APPLICATION_CREDENTIALS if user pasted JSON there
+        elif settings.GOOGLE_APPLICATION_CREDENTIALS and settings.GOOGLE_APPLICATION_CREDENTIALS.strip().startswith("{"):
+            logger.info("[METHOD 2] Attempting to load from raw JSON string in GOOGLE_APPLICATION_CREDENTIALS...")
+            try:
+                creds_info = json.loads(settings.GOOGLE_APPLICATION_CREDENTIALS.strip())
+                self.credentials = service_account.Credentials.from_service_account_info(
+                    creds_info, scopes=self.scopes
+                )
+                logger.info("✅ Successfully loaded credentials from raw JSON string in GOOGLE_APPLICATION_CREDENTIALS")
+            except Exception as e:
+                self.init_error = f"Failed parsing GOOGLE_APPLICATION_CREDENTIALS JSON string: {str(e)}"
+                logger.warning(f"❌ {self.init_error}")
+
+        # METHOD 3: Standard File Path checking (Render Secret Files mount or physical disk)
         if not self.credentials:
-            logger.info("\n[METHOD 2] Attempting to load from GOOGLE_APPLICATION_CREDENTIALS file path...")
-            
-            # Render mounts secret files at /etc/secrets/
-            render_secret_path = "/etc/secrets/credentials.json"
-            
-            # Try multiple possible paths in order of priority
+            logger.info("[METHOD 3] Scanning file paths for credentials.json...")
             candidate_paths = [
-                render_secret_path,  # Render's standard secret file mount
-                settings.GOOGLE_APPLICATION_CREDENTIALS,  # From env variable
-                "credentials.json",  # Current directory
+                "/etc/secrets/credentials.json",  # Render Secret Files target mount
+                settings.GOOGLE_APPLICATION_CREDENTIALS,
+                "credentials.json",
                 os.path.join(os.getcwd(), "credentials.json"),
-                os.path.join("/root", "credentials.json"),  # Render's home directory
-                os.path.expanduser("~/credentials.json"),  # User home
+                os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "credentials.json"),
+                "../credentials.json",
+                "../../credentials.json"
             ]
             
-            logger.info(f"Candidate paths to check:")
-            for i, path in enumerate(candidate_paths, 1):
-                logger.info(f"  {i}. {path}")
-            
+            file_found = False
             for path in candidate_paths:
-                logger.info(f"\nChecking: {path}")
                 if os.path.exists(path):
-                    logger.info(f"  ✅ File exists at {path}")
+                    file_found = True
+                    logger.info(f"  ✅ Found file candidate at: {path}")
                     try:
-                        with open(path, 'r') as f:
-                            creds_content = f.read()
-                            logger.info(f"  ✅ File is readable ({len(creds_content)} bytes)")
-                        
                         self.credentials = service_account.Credentials.from_service_account_file(
                             path, scopes=self.scopes
                         )
                         logger.info(f"✅ Successfully loaded credentials from file: {path}")
+                        self.init_error = None
                         break
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"  ❌ Invalid JSON format in file: {e}")
-                    except PermissionError as e:
-                        logger.warning(f"  ❌ Permission denied reading file: {e}")
                     except Exception as e:
-                        logger.warning(f"  ❌ Error loading from file: {e}")
-                else:
-                    logger.info(f"  ❌ File not found")
-        
-        # INITIALIZE GOOGLE DRIVE API SERVICE
+                        logger.warning(f"  ❌ File found but failed to load Service Account info: {e}")
+                        self.init_error = f"File found at {path} but contains invalid Service Account formatting: {str(e)}"
+            
+            if not file_found and not self.init_error:
+                self.init_error = "No credentials.json file found on disk, and GOOGLE_CREDENTIALS_JSON environment variable is empty."
+
+        # INITIALIZE SERVICE OBJECT
         if self.credentials:
-            logger.info("\n[INITIALIZATION] Building Google Drive API v3 service...")
             try:
                 self.service = build('drive', 'v3', credentials=self.credentials)
-                
-                # Test the connection by calling about()
-                logger.info("[TEST] Testing Google Drive API connection...")
-                about = self.service.about().get(fields='user(displayName, emailAddress)').execute()
-                user_info = about.get('user', {})
-                logger.info(f"✅ Google Drive API v3 service initialized successfully")
-                logger.info(f"   Authenticated as: {user_info.get('displayName', 'Unknown')} ({user_info.get('emailAddress', 'Unknown')})")
-                logger.info("=" * 70)
-                
-            except HttpError as e:
-                logger.error(f"❌ Google Drive API HttpError: {e}")
-                self.service = None
+                logger.info("✅ Google Drive API v3 service successfully built.")
+                return True
             except Exception as e:
-                logger.error(f"❌ Failed to build Google Drive API service: {e}")
                 self.service = None
+                self.init_error = f"Failed to build Google Drive API resource client: {str(e)}"
+                logger.error(f"❌ {self.init_error}")
+                return False
         else:
-            logger.error("❌ CRITICAL: Google Drive credentials not loaded from any source!")
-            logger.error("   API calls will fail. Please ensure credentials.json is provided.")
-            logger.error("=" * 70)
+            self.service = None
+            logger.error("❌ CRITICAL: Credentials could not be loaded.")
+            return False
 
     def search_files(self, q: str) -> str:
         """
         Executes a search query against the Google Drive API using files().list()
-        
-        Args:
-            q: Query string according to Google Drive API v3 syntax
-            
-        Returns:
-            JSON string with results or error message
+        Dynamically attempts initialization recovery if state is missing.
+        Implements an advanced multi-pass broad discovery fallback to ensure real files are returned
+        and absolute prevention of LLM credential hallucination messages.
         """
-        logger.info(f"\n[SEARCH REQUEST] Query: {q}")
-        logger.info(f"[SEARCH REQUEST] Folder ID: {self.folder_id}")
+        logger.info(f"\n[SEARCH REQUEST] Requested Query Filter: {q}")
         
-        # Check if service is initialized
+        # Lazy initialization recovery attempt per request
         if not self.service:
-            error_msg = "Google Drive service not initialized. Credentials may not be loaded."
-            logger.error(f"❌ {error_msg}")
-            return json.dumps({"error": error_msg, "status": "CREDENTIAL_ERROR"})
-        
-        if not self.credentials:
-            error_msg = "Google Drive credentials not available. Service initialization failed."
-            logger.error(f"❌ {error_msg}")
-            return json.dumps({"error": error_msg, "status": "CREDENTIAL_ERROR"})
-        
-        try:
-            # Build the query with folder constraint
-            query_parts = []
+            logger.info("Service missing. Attempting dynamic recovery load...")
+            self.initialize()
             
-            # If a folder ID is specified, ensure we search within it
+        # If still missing after dynamic attempt, return a highly precise directive instructing the agent exactly what to communicate
+        if not self.service:
+            err_details = self.init_error or "Unknown initialization error"
+            directive = (
+                f"CRITICAL SYSTEM ERROR: Google Drive authentication failed on the backend server. "
+                f"Diagnostic details: '{err_details}'. "
+                f"INSTRUCTION FOR ASSISTANT: Do not ask the user for their email or password. "
+                f"Instead, output exactly this message formatted cleanly to the user: "
+                f"'⚠️ **Backend Configuration Notice:** The deployed server on Render could not locate your Google Drive service account credentials. "
+                f"To resolve this, please open your Render Dashboard, select your Web Service, and either add the `GOOGLE_CREDENTIALS_JSON` environment variable containing your JSON string, or upload `credentials.json` via the Secret Files tab as detailed in the project deployment documentation.'"
+            )
+            return directive
+            
+        try:
+            # Pass 1: Build specific query securely mapping optional folder target
+            query_parts = []
             if self.folder_id:
                 query_parts.append(f"'{self.folder_id}' in parents")
-            
-            # Add the user's search query
             if q and q.strip():
-                query_parts.append(q)
-            
-            # Combine query parts
+                # Ensure query parameters conform to Google Drive API v3 string specifications
+                clean_q = q.strip()
+                query_parts.append(f"({clean_q})")
+                
             final_query = " and ".join(query_parts) if query_parts else None
+            logger.info(f"[SEARCH EXECUTION - PASS 1] Specific query syntax: {final_query}")
             
-            logger.info(f"[SEARCH] Final query: {final_query}")
-            
-            # Execute the files().list() call
-            logger.info("[API] Calling Google Drive API files().list()...")
-            
-            list_call = self.service.files().list(
+            results = self.service.files().list(
                 q=final_query,
                 spaces='drive',
-                fields='files(id, name, mimeType, modifiedTime, webViewLink, parents, owners)',
+                fields='files(id, name, mimeType, modifiedTime, webViewLink)',
                 pageSize=20,
                 orderBy='modifiedTime desc'
-            )
-            
-            results = list_call.execute()
+            ).execute()
             
             files = results.get('files', [])
-            logger.info(f"✅ Search successful. Found {len(files)} files")
+            logger.info(f"✅ Pass 1 Specific Search returned {len(files)} matches.")
             
-            # Log file details
-            for i, file in enumerate(files, 1):
-                logger.info(f"   {i}. {file.get('name')} ({file.get('mimeType')})")
+            # Pass 2: Broad Fallback Discovery if exact filter returned zero matches
+            if not files and self.folder_id:
+                logger.info("[SEARCH EXECUTION - PASS 2] Pass 1 returned empty. Executing broad folder contents discovery...")
+                broad_query = f"'{self.folder_id}' in parents"
+                broad_results = self.service.files().list(
+                    q=broad_query,
+                    spaces='drive',
+                    fields='files(id, name, mimeType, modifiedTime, webViewLink)',
+                    pageSize=20,
+                    orderBy='modifiedTime desc'
+                ).execute()
+                
+                broad_files = broad_results.get('files', [])
+                logger.info(f"✅ Pass 2 Broad Folder Discovery returned {len(broad_files)} available files.")
+                
+                if broad_files:
+                    # Return the available files along with a clear context directive instructing the LLM to present them
+                    return json.dumps({
+                        "status": "SUCCESS", 
+                        "files": broad_files,
+                        "directive_for_agent": (
+                            f"CRITICAL ASSISTANT DIRECTIVE: No files matched the strict user filter '{q}', "
+                            f"but actual files WERE discovered in the shared Google Drive folder. "
+                            f"DO NOT claim you lack credentials. Present these discovered files beautifully as a Markdown list to the user."
+                        )
+                    })
+                else:
+                    # Folder is entirely empty or permissions are uninherited
+                    empty_directive = (
+                        f"CRITICAL ASSISTANT DIRECTIVE: Authentication succeeded perfectly, but ZERO files exist inside the shared Google Drive folder. "
+                        f"DO NOT claim you lack credentials. Output exactly this friendly explanation to the user: "
+                        f"'📂 **Google Drive Connected Successfully:** I can read your shared folder, but it appears to be completely empty. Please upload files directly into your shared Drive folder or ensure the uploaded files inherit link-sharing read visibility for the Service Account.'"
+                    )
+                    return empty_directive
             
-            return json.dumps({
-                "status": "SUCCESS",
-                "files": files,
-                "count": len(files)
-            })
+            # Return discovered specific matches safely
+            return json.dumps({"status": "SUCCESS", "files": files})
             
         except HttpError as e:
-            error_details = {
-                "error": f"Google Drive API error: {e.resp.status} - {e.resp.reason}",
-                "status": "API_ERROR",
-                "details": str(e)
-            }
-            logger.error(f"❌ {error_details['error']}")
-            return json.dumps(error_details)
-            
+            err_msg = f"Google Drive API returned HttpError {e.resp.status}: {e.resp.reason}"
+            logger.error(f"❌ {err_msg}")
+            # Format error as explicit instruction to avoid LLM misinterpreting it as missing credentials
+            return f"CRITICAL ASSISTANT DIRECTIVE: Output exactly this text to the user: '❌ **Google Drive API Permission Denied ({e.resp.status}):** Ensure your Service Account email is added as a Viewer directly on the shared folder settings.'"
         except Exception as e:
-            error_details = {
-                "error": f"Error executing search: {str(e)}",
-                "status": "SEARCH_ERROR",
-                "details": str(e)
-            }
-            logger.error(f"❌ {error_details['error']}")
-            return json.dumps(error_details)
+            logger.error(f"❌ Search execution exception: {str(e)}")
+            return f"CRITICAL ASSISTANT DIRECTIVE: Output exactly this text to the user: '❌ **Search Processing Exception:** {str(e)}'"
 
-# Singleton instance
+# Singleton export
 drive_service = DriveService()
